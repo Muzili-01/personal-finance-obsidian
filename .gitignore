@@ -1,0 +1,21 @@
+# macOS Finder metadata
+.DS_Store
+
+# Python caches, coverage, and virtual environments
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Local configuration and generated personal-finance data
+.env
+.env.*
+!.env.example
+Finance/
+*.sqlite3
+*.sqlite
+*.db

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Obsidian 个人财务"
+  short_description: "整理账单、退款、负债并生成 Obsidian 财务月报"
+  default_prompt: "使用 $personal-finance-obsidian 导入我的账单并更新 Obsidian 财务面板。"

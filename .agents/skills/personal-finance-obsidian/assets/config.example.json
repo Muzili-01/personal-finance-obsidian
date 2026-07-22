@@ -1,0 +1,13 @@
+{
+  "category_rules": [
+    {"pattern": "星巴克|咖啡|餐厅|饭店|美团外卖|饿了么|肯德基|麦当劳", "category_primary": "餐饮"},
+    {"pattern": "地铁|公交|滴滴|高德打车|铁路|航空|加油", "category_primary": "交通"},
+    {"pattern": "京东|淘宝|天猫|拼多多|商场|超市|便利店", "category_primary": "购物"},
+    {"pattern": "医院|药房|诊所|体检", "category_primary": "医疗"},
+    {"pattern": "课程|书店|图书|教育|培训", "category_primary": "学习"},
+    {"pattern": "APPLE.COM/BILL|会员|订阅|云服务", "category_primary": "订阅"},
+    {"pattern": "电影|游戏|演出|娱乐", "category_primary": "娱乐"},
+    {"pattern": "水费|电费|燃气|物业|房租|话费|宽带", "category_primary": "居住与账单"}
+  ],
+  "merchant_overrides": {}
+}

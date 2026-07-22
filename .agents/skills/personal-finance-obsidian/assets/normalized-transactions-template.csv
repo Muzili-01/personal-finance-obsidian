@@ -1,0 +1,2 @@
+transaction_date,source_platform,account_name,merchant,description,amount,direction,transaction_type,payment_method,status,platform_transaction_id,merchant_order_id,account_last4
+2026-07-01 12:00:00,alipay,支付宝,示例商户,示例商品,10.00,expense,purchase,余额,交易成功,,,
