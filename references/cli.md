@@ -1,4 +1,6 @@
-# CLI Examples
+# 高级用法：CLI
+
+普通账单处理应通过 `$personal-finance-obsidian` 完成。仅在调试、批量重建、自动化或人工复核退款时直接使用以下命令。
 
 Replace `<SKILL_DIR>` with the directory containing `SKILL.md` and `<VAULT>` with the Obsidian Vault root.
 

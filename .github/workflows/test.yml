@@ -22,4 +22,4 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Run regression tests
-        run: python -m unittest discover -s .agents/skills/personal-finance-obsidian/tests -v
+        run: python -m unittest discover -s tests -v
