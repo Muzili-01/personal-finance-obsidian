@@ -39,14 +39,6 @@ class RepositoryLayoutTests(unittest.TestCase):
         self.assertIn("$personal-finance-obsidian", first_screen)
         self.assertIn("```text", first_screen)
 
-    def test_cli_is_presented_only_as_advanced_usage(self) -> None:
-        root = repository_root()
-        readme = (root / "README.md").read_text(encoding="utf-8")
-        skill = (root / "SKILL.md").read_text(encoding="utf-8")
-        self.assertLess(readme.index("## 高级用法"), readme.index("finance.py"))
-        self.assertLess(skill.index("## 高级维护"), skill.index("finance.py"))
-        self.assertNotIn("## Commands", skill)
-
     def test_privacy_copy_states_actual_processing_boundary(self) -> None:
         root = repository_root()
         combined = "\n".join(

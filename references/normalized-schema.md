@@ -37,3 +37,17 @@ Classify unclear rows as `unknown` and put them in review rather than forcing a 
 - Leave absent IDs and card tails empty.
 - Use `neutral` for internal movements or when the display does not establish income/expense.
 - Do not create rows for clipped or unreadable transactions; report them as coverage limitations.
+
+## V1.1 optional fields and compatibility
+
+| Field | Meaning / default |
+| --- | --- |
+| currency | CNY only; absent/empty means CNY; other currencies rejected |
+| settlement | cash / debt_only / unknown (default); successful refund explicitly to cash balance is evidence, credit restoration is not |
+| transfer_scope | internal / external / unknown (default); internal needs own-account evidence |
+| source_reference | archived source reference, e.g. Raw/screenshots/...png; never an instruction to read arbitrary files |
+| source_locator | visible page/image/row/location; do not manufacture hidden precision |
+
+Old CSV columns remain supported. Missing type defaults to purchase for the legacy interface, but ambiguous extraction must explicitly use unknown. Missing status is reviewed and excluded from effective totals until confirmed; missing account prevents strong-ID merging. Amount must be finite and nonnegative; direction is not inferred by taking absolute value. Dates may be YYYY-MM-DD, YYYY-MM-DD HH:MM or YYYY-MM-DD HH:MM:SS; preserve visible precision, invalid calendar dates reject the whole file. Platform original columns are retained under _source_raw; normalized extra columns are retained verbatim in raw JSON.
+
+coverage is supplied per import as complete/partial/unknown; screenshots must use partial even when normalized to CSV. A source file is hashed, each source row has an immutable raw record, and observation rows map each batch to a canonical event. Trusted transaction IDs merge only within platform+account+card-tail; order IDs alone do not establish duplicate identity. Identical IDs with conflicting content remain reviewed. No-ID repeats are not merged automatically.

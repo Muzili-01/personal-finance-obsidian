@@ -1,0 +1,12 @@
+filters:
+  and:
+    - 'type == "finance-month"'
+views:
+  - type: table
+    name: 月报索引
+    order:
+      - month
+      - total_consumption
+      - cash_outflow
+      - coverage
+      - analysis_status

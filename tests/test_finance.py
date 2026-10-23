@@ -40,6 +40,7 @@ class FinanceCliTests(unittest.TestCase):
             "platform_transaction_id",
             "merchant_order_id",
             "account_last4",
+            "settlement",
         ]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -782,6 +783,7 @@ class FinanceCliTests(unittest.TestCase):
                         "transaction_type": "refund",
                         "payment_method": "花呗",
                         "status": "退款成功",
+                        "settlement": "cash",
                         "platform_transaction_id": "A900",
                         "merchant_order_id": "M100",
                         "account_last4": "",

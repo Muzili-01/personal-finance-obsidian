@@ -19,3 +19,30 @@ Finance/
 *.sqlite3
 *.sqlite
 *.db
+
+# Internal notes, execution scratch, builds and private data must stay outside Git
+/private-notes/
+/release-artifacts/
+/HANDOFF.md
+/CONTEXT.md
+/.superpowers/
+/.worktrees/
+/worktrees/
+/tmp/
+/target/
+/build/
+/dist/
+/.cache/
+*.sqlite3-wal
+*.sqlite3-shm
+*.db-wal
+*.db-shm
+*.dmg
+*.pkg
+*.app/
+*.zip
+
+# Lowercase internal handoffs must not be copied into the public root
+/context.md
+/handoff.md
+/v11-progress.md
