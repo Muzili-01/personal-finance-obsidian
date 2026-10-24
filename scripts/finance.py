@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import argparse
+from functools import wraps
+from finance_storage import atomic_write_text, migrate_database, vault_lock
+import finance_matching as matching
 from collections import defaultdict
 import csv
 import difflib
 import hashlib
 import io
+import os
 import json
 import re
 import shutil
@@ -26,6 +30,8 @@ FINANCE_DIRS = (
     "Reviews",
     "Assets/Charts",
     "Templates",
+    "Imports",
+    "Backups",
 )
 
 
@@ -112,6 +118,15 @@ def connect(vault: Path) -> sqlite3.Connection:
     return connection
 
 
+def locked(function):
+    @wraps(function)
+    def wrapper(vault, *args, **kwargs):
+        with vault_lock(finance_root(vault)):
+            return function(vault, *args, **kwargs)
+    return wrapper
+
+
+@locked
 def init_vault(vault: Path) -> None:
     root = finance_root(vault)
     for relative in FINANCE_DIRS:
@@ -122,6 +137,7 @@ def init_vault(vault: Path) -> None:
         shutil.copy2(bundled_config, config_path)
     with connect(vault) as connection:
         connection.executescript(SCHEMA)
+        migrate_database(connection, root / "Backups")
 
 
 def file_sha256(path: Path) -> str:
@@ -138,6 +154,8 @@ def amount_to_minor(value: str) -> int:
         amount = Decimal(cleaned)
     except InvalidOperation as exc:
         raise ValueError("无法解析金额: {0}".format(value)) from exc
+    if not amount.is_finite() or amount < 0:
+        raise ValueError("金额必须为非负有限数")
     return int((amount * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
@@ -182,30 +200,46 @@ def source_rows(path: Path) -> Iterable[tuple[int, Dict[str, str]]]:
 
     reader = csv.DictReader(io.StringIO("\n".join(lines[header_index:])))
     for offset, raw in enumerate(reader, start=header_index + 2):
+        if None in raw:
+            raise ValueError("第 {0} 行列数超过表头".format(offset))
         row = {(key or "").strip(): (value or "").strip() for key, value in raw.items()}
         if source_kind == "normalized":
-            if not row.get("transaction_date"):
+            if not any(row.values()):
                 continue
             yield offset, row
             continue
-        if not row.get("交易时间") or not re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}", row["交易时间"]):
+        if not row.get("交易时间"):
+            if any(row.get(key) for key in ('交易对方','金额','金额(元)')):
+                raise ValueError('第 {0} 行缺少日期'.format(offset))
             continue
+        if not re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}",row['交易时间']):
+            if row['交易时间'].startswith(('---','共','合计','统计')):
+                continue
+            raise ValueError('第 {0} 行日期无效'.format(offset))
         if source_kind == "alipay":
-            yield offset, normalize_alipay_row(row)
+            normalized = normalize_alipay_row(row)
+            normalized["_source_raw"] = row
+            yield offset, normalized
         else:
-            yield offset, normalize_wechat_row(row)
+            normalized = normalize_wechat_row(row)
+            normalized["_source_raw"] = row
+            yield offset, normalized
 
 
 def normalize_alipay_row(row: Dict[str, str]) -> Dict[str, str]:
     searchable = " ".join(
         row.get(key, "") for key in ("交易分类", "商品说明", "交易状态", "备注")
     )
-    if "退款" in searchable:
+    if "退款" in searchable and row.get("收/支") not in ("支出", "支"):
         transaction_type = "refund"
     elif "还款" in searchable:
         transaction_type = "repayment"
     elif any(keyword in searchable for keyword in ("余额宝转入", "余额宝转出", "转账")):
         transaction_type = "transfer"
+    elif any(keyword in searchable for keyword in ('余额宝收益','零钱通收益','投资收益')):
+        transaction_type = 'investment_income'
+    elif row.get('收/支') in ('收入','收'):
+        transaction_type = 'income'
     else:
         transaction_type = "purchase"
     direction_map = {"支出": "expense", "收入": "income", "收": "income", "支": "expense"}
@@ -235,7 +269,7 @@ def normalize_wechat_row(row: Dict[str, str]) -> Dict[str, str]:
     searchable = " ".join(
         row.get(key, "") for key in ("交易类型", "商品", "当前状态", "备注")
     )
-    if "退款" in searchable or "退还" in searchable:
+    if ("退款" in searchable or "退还" in searchable) and row.get("收/支") not in ("支出", "支"):
         transaction_type = "refund"
     elif "还款" in searchable:
         transaction_type = "repayment"
@@ -281,7 +315,17 @@ def load_config(vault: Path) -> Dict[str, object]:
     if not path.exists():
         return {"category_rules": [], "merchant_overrides": {}}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        config=json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(config,dict) or not isinstance(config.get('category_rules',[]),list) or not isinstance(config.get('merchant_overrides',{}),dict):
+            raise ValueError('Finance/Data/config.json 配置结构无效')
+        for rule in config.get('category_rules',[]):
+            if not isinstance(rule,dict) or not rule.get('pattern') or not rule.get('category_primary'):
+                raise ValueError('config.json 分类规则缺少字段')
+            try:
+                re.compile(rule['pattern'])
+            except (re.error,TypeError) as exc:
+                raise ValueError('config.json 分类规则正则无效') from exc
+        return config
     except json.JSONDecodeError as exc:
         raise ValueError("Finance/Data/config.json 不是有效 JSON") from exc
 
@@ -309,6 +353,7 @@ def categorize(row: Dict[str, str], config: Dict[str, object]) -> str:
     return "待分类"
 
 
+@locked
 def archive_file(
     vault: Path,
     source_file: Path,
@@ -346,223 +391,147 @@ def archive_file(
     return archived_source
 
 
-def import_file(vault: Path, source_file: Path) -> int:
+ALLOWED_TYPES = set("purchase refund transfer repayment installment fee interest cash_withdrawal income investment_buy investment_sell investment_income topup withdrawal adjustment unknown".split())
+
+
+def validate_row(row, source_row):
+    try:
+        value = row.get("transaction_date", "")
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}(?::\d{2})?)?", value):
+            raise ValueError("日期格式无效")
+        datetime.fromisoformat(value)
+        amount_to_minor(row["amount"])
+        if row.get("direction") not in ("expense", "income", "neutral"):
+            raise ValueError("direction 无效")
+        if row.get("transaction_type", "purchase") not in ALLOWED_TYPES:
+            raise ValueError("transaction_type 无效")
+        if row.get("currency", "CNY") not in ("", "CNY"):
+            raise ValueError("仅支持 CNY 币种")
+        if not row.get("source_platform"):
+            raise ValueError("缺少 source_platform")
+        if row.get("settlement", "unknown") not in ("", "unknown", "cash", "debt_only"):
+            raise ValueError("settlement 无效")
+        if row.get("transfer_scope", "unknown") not in ("", "unknown", "internal", "external"):
+            raise ValueError("transfer_scope 无效")
+    except (ValueError, KeyError, InvalidOperation, OverflowError) as exc:
+        raise ValueError("第 {0} 行: {1}".format(source_row, exc)) from exc
+
+
+def event_identity(row, raw_id):
+    if row.get("platform_transaction_id") and row.get("account_name"):
+        return stable_id("event", row["source_platform"], row["account_name"], row.get("account_last4", ""), row["platform_transaction_id"])
+    return stable_id("observation", raw_id)
+
+
+def _totals(connection):
+    totals = defaultdict(int)
+    for row in connection.execute("SELECT * FROM transactions WHERE active=1 AND transaction_type='purchase' AND active=1 AND excluded_reason IS NULL"):
+        totals[row["transaction_time"][:7]] += purchase_net_amount(connection, row)
+    return dict(totals)
+
+
+def persist_receipt(vault: Path, name: str, receipt: dict) -> None:
+    try:
+        atomic_write_text(finance_root(vault)/'Imports'/name,json.dumps(receipt,ensure_ascii=False,indent=2))
+    except OSError as exc:
+        message='总账已更新，回执/页面待重建；请运行 build-all，勿重复入账: '+str(exc)
+        with connect(vault) as con:
+            con.execute("UPDATE report_state SET status='failed',error=?",(message,))
+        raise ValueError(message) from exc
+
+
+@locked
+def import_with_receipt(vault: Path, source_file: Path, *, coverage="unknown", source_reference="", reactivate=False, account_name="") -> dict:
+    if coverage not in ("complete", "partial", "unknown"):
+        raise ValueError("coverage 无效")
     init_vault(vault)
     source_file = source_file.expanduser().resolve()
     source_hash = file_sha256(source_file)
-    parsed_rows = list(source_rows(source_file))
-    if not parsed_rows:
-        raise ValueError("账单中没有可导入的交易记录")
-    source_platform = parsed_rows[0][1].get("source_platform", "unknown") or "unknown"
-    archived_source = archive_file(
-        vault, source_file, source_platform, "structured-export"
-    )
-    inserted = 0
+    # Archive before parsing, including hard failures. The archive alone is not
+    # a successful accounting batch.
+    try:
+        parsed = list(source_rows(source_file))
+        if not parsed:
+            raise ValueError("账单中没有可导入的交易记录")
+    except (ValueError, UnicodeError, csv.Error):
+        archive_file(vault,source_file,'incoming',coverage)
+        raise
+    platform = parsed[0][1].get("source_platform") or 'incoming'
+    archived = archive_file(vault, source_file, platform, coverage)
+    for line, row in parsed:
+        if account_name:
+            if '_source_raw' not in row:
+                row['_source_raw']=dict(row)
+            row['account_name']=account_name
+        validate_row(row, line)
     config = load_config(vault)
-    with connect(vault) as connection:
-        for source_row, row in parsed_rows:
-            raw_id = stable_id(source_hash, source_row)
-            transaction_id = stable_id(raw_id, row.get("platform_transaction_id", ""))
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO raw_records
-                    (raw_id, source_file, source_hash, source_row, raw_json)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    raw_id,
-                    str(archived_source),
-                    source_hash,
-                    source_row,
-                    json.dumps(row, ensure_ascii=False, sort_keys=True),
-                ),
-            )
-            cursor = connection.execute(
-                """
-                INSERT OR IGNORE INTO transactions (
-                    transaction_id, raw_id, transaction_time, source_platform,
-                    account_name, merchant_raw, description, amount_minor,
-                    direction, transaction_type, payment_method, status,
-                    platform_transaction_id, merchant_order_id, account_last4,
-                    category_primary
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    transaction_id,
-                    raw_id,
-                    row["transaction_date"],
-                    row["source_platform"],
-                    row.get("account_name", ""),
-                    row["merchant"],
-                    row.get("description", ""),
-                    amount_to_minor(row["amount"]),
-                    row["direction"],
-                    row.get("transaction_type", "purchase"),
-                    row.get("payment_method", ""),
-                    row.get("status", ""),
-                    row.get("platform_transaction_id", ""),
-                    row.get("merchant_order_id", ""),
-                    row.get("account_last4", ""),
-                    categorize(row, config),
-                ),
-            )
-            inserted += cursor.rowcount
-        match_duplicates(connection)
-        match_refunds(connection)
-    return inserted
+    with connect(vault) as con:
+        before = _totals(con)
+        before_links={tuple(r) for r in con.execute('SELECT refund_id,purchase_id FROM refund_links')}
+        batch = con.execute("SELECT * FROM import_batches WHERE source_hash=? AND account_scope=?", (source_hash,account_name)).fetchone()
+        if batch and batch["status"] == "undone" and not reactivate:
+            raise ValueError("此文件批次已撤销；需明确重新纳入（reactivate）")
+        if batch and batch["status"] == "active":
+            return dict(batch_id=batch["batch_id"], inserted_count=0, duplicate_count=len(parsed), affected_months=[], status="already_imported", consumption_changes={}, artifact_status=con.execute('SELECT status FROM report_state').fetchone()[0],source_name=source_file.name,source_file=batch['source_file'],created_at=batch['created_at'])
+        batch_id = batch["batch_id"] if batch else stable_id("batch", source_hash,account_name)
+        con.execute("INSERT OR IGNORE INTO import_batches(batch_id,source_hash,source_file,coverage,source_reference,created_at,account_scope) VALUES(?,?,?,?,?,?,?)",
+                    (batch_id, source_hash, str(archived), coverage, source_reference, datetime.now().isoformat(),account_name))
+        con.execute("UPDATE import_batches SET status='active' WHERE batch_id=?", (batch_id,))
+        inserted = 0
+        for line, row in parsed:
+            raw_id = stable_id(source_hash,line,account_name) if account_name else stable_id(source_hash,line)
+            tid = event_identity(row, raw_id)
+            # Legacy IDs remain stable after migration.
+            if row.get("platform_transaction_id") and row.get("account_name"):
+                old = con.execute("SELECT * FROM transactions WHERE source_platform=? AND account_name=? AND account_last4=? AND platform_transaction_id=? AND COALESCE(excluded_reason,'')!='identity_duplicate' ORDER BY transaction_id LIMIT 1", (row["source_platform"],row["account_name"],row.get("account_last4", ""),row["platform_transaction_id"])).fetchone()
+                if old:
+                    tid = old["transaction_id"]
+            con.execute("INSERT OR IGNORE INTO raw_records VALUES(?,?,?,?,?)", (raw_id, str(archived), source_hash, line, json.dumps(row, ensure_ascii=False, sort_keys=True)))
+            existing = con.execute("SELECT * FROM transactions WHERE transaction_id=?", (tid,)).fetchone()
+            if existing:
+                pairs = (("transaction_time","transaction_date"),("merchant_raw","merchant"),("direction","direction"),("transaction_type","transaction_type"))
+                conflict = any(existing[a] != row.get(b, "purchase" if b == "transaction_type" else "") for a,b in pairs) or existing["amount_minor"] != amount_to_minor(row["amount"])
+                if conflict:
+                    con.execute("INSERT OR REPLACE INTO review_items VALUES(?,?, 'source_conflict', ?, 'pending')", (stable_id(tid,"source_conflict"), tid, json.dumps({"reason":"同账户交易号内容冲突", "raw_id":raw_id}, ensure_ascii=False)))
+            else:
+                values = (tid, raw_id, row["transaction_date"], row["source_platform"], row.get("account_name", ""), row["merchant"], row.get("description", ""), amount_to_minor(row["amount"]), row["direction"], row.get("transaction_type", "purchase"), row.get("payment_method", ""), row.get("status", ""), row.get("platform_transaction_id", ""), row.get("merchant_order_id", ""), row.get("account_last4", ""), categorize(row, config), row.get("settlement", "unknown") or "unknown", row.get("source_reference",source_reference), row.get("source_locator", ""), row.get("transfer_scope", "unknown") or "unknown")
+                con.execute("""INSERT INTO transactions(transaction_id,raw_id,transaction_time,source_platform,account_name,merchant_raw,description,amount_minor,direction,transaction_type,payment_method,status,platform_transaction_id,merchant_order_id,account_last4,category_primary,settlement,source_reference,source_locator,transfer_scope) VALUES(""" + ','.join('?' for _ in values) + ')', values)
+                fresh=con.execute('SELECT * FROM transactions WHERE transaction_id=?',(tid,)).fetchone()
+                con.execute('UPDATE transactions SET category_primary=? WHERE transaction_id=?',(effective_category(con,fresh,config),tid))
+                inserted += 1
+            con.execute("INSERT OR IGNORE INTO transaction_observations VALUES(?,?,?)", (raw_id,tid,batch_id))
+        con.execute("UPDATE transactions SET active=EXISTS(SELECT 1 FROM transaction_observations o JOIN import_batches b ON b.batch_id=o.batch_id WHERE o.transaction_id=transactions.transaction_id AND b.status='active')")
+        match_duplicates(con)
+        match_refunds(con)
+        after = _totals(con)
+        affected = sorted(set(row['transaction_date'][:7] for _,row in parsed) | {m for m in set(before)|set(after) if before.get(m,0)!=after.get(m,0)})
+        receipt = dict(batch_id=batch_id, inserted_count=inserted, duplicate_count=len(parsed)-inserted, affected_months=affected, status="imported", consumption_changes={m:dict(before=money(before.get(m,0)),after=money(after.get(m,0)),delta=money(after.get(m,0)-before.get(m,0))) for m in affected}, artifact_status="pending")
+        receipt.update(source_name=source_file.name,source_file=str(archived),created_at=datetime.now().isoformat())
+        after_links={tuple(r) for r in con.execute('SELECT refund_id,purchase_id FROM refund_links')}
+        receipt['linked_refund_count']=len(after_links-before_links)
+        receipt['unlinked_refund_count']=len(before_links-after_links)
+        receipt['total_linked_refund_count']=con.execute('SELECT COUNT(*) FROM refund_links l JOIN transactions t ON t.transaction_id=l.refund_id WHERE t.active=1').fetchone()[0]
+        receipt['account_scope']=account_name
+        receipt['review_count']=len(matching.list_reviews(con))
+        receipt['artifacts']=[str(finance_root(vault)/'Months'/(m+'.md')) for m in affected]+[str(finance_root(vault)/'Dashboard.md')]
+        con.execute("UPDATE import_batches SET receipt_json=? WHERE batch_id=?", (json.dumps(receipt,ensure_ascii=False),batch_id))
+        con.execute("UPDATE report_state SET status='pending', error='' WHERE singleton=1")
+    persist_receipt(vault,batch_id+'.json',receipt)
+    return receipt
 
 
-def match_refunds(connection: sqlite3.Connection) -> None:
-    refunds = connection.execute(
-        "SELECT * FROM transactions WHERE transaction_type = 'refund'"
-    ).fetchall()
-    for refund in refunds:
-        purchase = None
-        if refund["merchant_order_id"]:
-            purchase = connection.execute(
-                """
-                SELECT * FROM transactions
-                WHERE transaction_type = 'purchase'
-                  AND source_platform = ?
-                  AND merchant_order_id = ?
-                  AND transaction_time <= ?
-                ORDER BY transaction_time DESC
-                LIMIT 1
-                """,
-                (
-                    refund["source_platform"],
-                    refund["merchant_order_id"],
-                    refund["transaction_time"],
-                ),
-            ).fetchone()
-        if purchase and purchase_net_amount(connection, purchase) >= refund["amount_minor"]:
-            connection.execute(
-                """
-                INSERT OR REPLACE INTO refund_links
-                    (refund_id, purchase_id, matched_by, confidence)
-                VALUES (?, ?, 'merchant_order_id', 1.0)
-                """,
-                (refund["transaction_id"], purchase["transaction_id"]),
-            )
-            connection.execute(
-                "DELETE FROM review_items WHERE transaction_id = ? AND issue_type = 'refund_match'",
-                (refund["transaction_id"],),
-            )
-            continue
-
-        candidates = connection.execute(
-            """
-            SELECT * FROM transactions
-            WHERE transaction_type = 'purchase'
-              AND source_platform = ?
-              AND transaction_time <= ?
-              AND julianday(?) - julianday(transaction_time) BETWEEN 0 AND 365
-            ORDER BY transaction_time DESC
-            """,
-            (refund["source_platform"], refund["transaction_time"], refund["transaction_time"]),
-        ).fetchall()
-        eligible = []
-        for candidate in candidates:
-            if purchase_net_amount(connection, candidate) < refund["amount_minor"]:
-                continue
-            if (
-                refund["payment_method"]
-                and candidate["payment_method"]
-                and refund["payment_method"] != candidate["payment_method"]
-            ):
-                continue
-            similarity = merchant_similarity(refund["merchant_raw"], candidate["merchant_raw"])
-            if similarity >= 0.82:
-                eligible.append((candidate, similarity))
-        if len(eligible) == 1:
-            candidate, similarity = eligible[0]
-            connection.execute(
-                """
-                INSERT OR REPLACE INTO refund_links
-                    (refund_id, purchase_id, matched_by, confidence)
-                VALUES (?, ?, 'unique_merchant_amount', ?)
-                """,
-                (refund["transaction_id"], candidate["transaction_id"], max(0.90, similarity)),
-            )
-            connection.execute(
-                "DELETE FROM review_items WHERE transaction_id = ? AND issue_type = 'refund_match'",
-                (refund["transaction_id"],),
-            )
-        else:
-            details = {
-                "reason": "ambiguous" if len(eligible) > 1 else "no_candidate",
-                "candidate_purchase_ids": [item[0]["transaction_id"] for item in eligible],
-            }
-            connection.execute(
-                """
-                INSERT OR REPLACE INTO review_items
-                    (review_id, transaction_id, issue_type, details_json, status)
-                VALUES (?, ?, 'refund_match', ?, 'pending')
-                """,
-                (
-                    stable_id(refund["transaction_id"], "refund_match"),
-                    refund["transaction_id"],
-                    json.dumps(details, ensure_ascii=False, sort_keys=True),
-                ),
-            )
+def import_file(vault: Path, source_file: Path) -> int:
+    return import_with_receipt(vault, source_file)["inserted_count"]
 
 
-def match_duplicates(connection: sqlite3.Connection) -> None:
-    credit_rows = connection.execute(
-        """
-        SELECT * FROM transactions
-        WHERE transaction_type = 'purchase'
-          AND source_platform = 'credit_card'
-          AND excluded_reason IS NULL
-        """
-    ).fetchall()
-    for credit in credit_rows:
-        platforms = connection.execute(
-            """
-            SELECT * FROM transactions
-            WHERE transaction_type = 'purchase'
-              AND source_platform IN ('alipay', 'wechat')
-              AND amount_minor = ?
-              AND excluded_reason IS NULL
-              AND ABS(julianday(transaction_time) - julianday(?)) <= 2
-            """,
-            (credit["amount_minor"], credit["transaction_time"]),
-        ).fetchall()
-        candidates = []
-        for platform in platforms:
-            if credit["account_last4"]:
-                payment_digits = "".join(re.findall(r"\d", platform["payment_method"]))
-                if credit["account_last4"] not in payment_digits:
-                    continue
-            similarity = merchant_similarity(credit["merchant_raw"], platform["merchant_raw"])
-            if similarity >= 0.72:
-                candidates.append(platform)
-        if len(candidates) == 1:
-            connection.execute(
-                """
-                UPDATE transactions
-                SET excluded_reason = 'duplicate', duplicate_of = ?
-                WHERE transaction_id = ?
-                """,
-                (candidates[0]["transaction_id"], credit["transaction_id"]),
-            )
+match_refunds = matching.match_refunds
+match_duplicates = matching.match_duplicates
+merchant_similarity = matching.merchant_similarity
 
 
-def merchant_similarity(left: str, right: str) -> float:
-    def normalize(value: str) -> str:
-        normalized = "".join(character.lower() for character in value if character.isalnum())
-        for prefix in ("支付宝", "财付通", "微信支付", "微信"):
-            if normalized.startswith(prefix):
-                normalized = normalized[len(prefix) :]
-        return normalized
-
-    left_normalized = normalize(left)
-    right_normalized = normalize(right)
-    if not left_normalized or not right_normalized:
-        return 0.0
-    if left_normalized == right_normalized:
-        return 1.0
-    return difflib.SequenceMatcher(None, left_normalized, right_normalized).ratio()
+def list_reviews(vault: Path) -> list:
+    with connect_readonly(vault) as con:
+        return matching.list_reviews(con)
 
 
 def money(minor: int) -> str:
@@ -573,6 +542,7 @@ def money_display(minor: int) -> str:
     return "{0:,.2f}".format(Decimal(minor) / Decimal(100))
 
 
+@locked
 def save_debt_snapshot(
     vault: Path,
     account: str,
@@ -597,48 +567,247 @@ def save_debt_snapshot(
                 stable_id(account, as_of_date),
                 account,
                 as_of_date,
-                amount_to_minor(outstanding),
-                amount_to_minor(due),
+                amount_to_minor(outstanding) if outstanding else None,
+                amount_to_minor(due) if due else None,
                 due_date,
             ),
         )
+        connection.execute("UPDATE report_state SET status='pending'")
 
 
-def link_refund_manually(vault: Path, refund_id: str, purchase_id: str) -> None:
+@locked
+def link_refund_manually(vault: Path, refund_id: str, purchase_id: str, *, snapshot=None) -> None:
     init_vault(vault)
-    with connect(vault) as connection:
-        refund = connection.execute(
-            "SELECT * FROM transactions WHERE transaction_id = ?",
-            (refund_id,),
-        ).fetchone()
-        purchase = connection.execute(
-            "SELECT * FROM transactions WHERE transaction_id = ?",
-            (purchase_id,),
-        ).fetchone()
-        if refund is None or refund["transaction_type"] != "refund":
-            raise ValueError("refund-id 不是有效的退款交易")
-        if purchase is None or purchase["transaction_type"] != "purchase":
-            raise ValueError("purchase-id 不是有效的消费交易")
-        if refund["transaction_time"] < purchase["transaction_time"]:
-            raise ValueError("退款时间早于消费时间，不能关联")
-        if purchase_net_amount(connection, purchase) < refund["amount_minor"]:
-            raise ValueError("退款金额超过该消费尚未退款的金额")
-        connection.execute(
-            """
-            INSERT OR REPLACE INTO refund_links
-                (refund_id, purchase_id, matched_by, confidence)
-            VALUES (?, ?, 'manual', 1.0)
-            """,
-            (refund_id, purchase_id),
-        )
-        connection.execute(
-            """
-            UPDATE review_items
-            SET status = 'resolved'
-            WHERE transaction_id = ? AND issue_type = 'refund_match'
-            """,
-            (refund_id,),
-        )
+    with connect(vault) as con:
+        if snapshot is not None:
+            current = [r for r in matching.list_reviews(con) if r['transaction_id']==refund_id and r['snapshot']==snapshot]
+            if not current or purchase_id not in {c['transaction_id'] for r in current for c in r['candidates']}:
+                raise ValueError('候选列表已变化，请重新展示并确认')
+        refund = con.execute('SELECT * FROM transactions WHERE transaction_id=?',(refund_id,)).fetchone()
+        purchase = con.execute('SELECT * FROM transactions WHERE transaction_id=?',(purchase_id,)).fetchone()
+        if not refund or refund['transaction_type']!='refund' or not refund['active'] or refund['excluded_reason']:
+            raise ValueError('refund-id 不是有效的退款交易')
+        if not purchase or purchase['transaction_type']!='purchase' or not purchase['active'] or purchase['excluded_reason']:
+            raise ValueError('purchase-id 不是有效的规范消费交易')
+        if refund['transaction_time']<purchase['transaction_time']:
+            raise ValueError('退款时间早于消费时间，不能关联')
+        old = con.execute('SELECT * FROM refund_links WHERE refund_id=?',(refund_id,)).fetchone()
+        available = purchase_net_amount(con,purchase)
+        if old and old['purchase_id']==purchase_id:
+            available += refund['amount_minor']
+        if refund['amount_minor']>available:
+            raise ValueError('退款金额超过该消费尚未退款的金额')
+        con.execute("INSERT INTO decisions(kind,target_id,value_json,created_at) VALUES('link_refund',?,?,?)",(refund_id,json.dumps(dict(purchase_id=purchase_id,candidates=matching.refund_candidates(con,refund)[0])),datetime.now().isoformat()))
+        con.execute("UPDATE decisions SET active=0 WHERE kind IN ('unlink_refund','migration_refund_conflict') AND target_id=?",(refund_id,))
+        con.execute('DELETE FROM refund_rejections WHERE refund_id=? AND purchase_id=?',(refund_id,purchase_id))
+        con.execute("INSERT OR REPLACE INTO refund_links VALUES(?,?,'manual',1.0)",(refund_id,purchase_id))
+        con.execute("UPDATE review_items SET status='resolved' WHERE transaction_id=? AND issue_type IN ('refund_match','manual_conflict')",(refund_id,))
+        con.execute("UPDATE report_state SET status='pending'")
+
+
+@locked
+def unlink_refund(vault: Path, refund_id: str) -> None:
+    with connect(vault) as con:
+        link = con.execute('SELECT * FROM refund_links WHERE refund_id=?',(refund_id,)).fetchone()
+        if link:
+            con.execute('INSERT OR IGNORE INTO refund_rejections VALUES(?,?)',(refund_id,link['purchase_id']))
+            con.execute('DELETE FROM refund_links WHERE refund_id=?',(refund_id,))
+        con.execute("INSERT INTO decisions(kind,target_id,value_json,created_at) VALUES('unlink_refund',?,'{}',?)",(refund_id,datetime.now().isoformat()))
+        match_refunds(con)
+        con.execute("UPDATE report_state SET status='pending'")
+
+
+def effective_category(connection, row, config):
+    if row['category_manual']:
+        return row['category_manual']
+    rules = connection.execute("SELECT category FROM category_rules WHERE merchant=? AND effective_from<=? ORDER BY rule_id DESC LIMIT 1",(row['merchant_raw'],row['transaction_time'])).fetchone()
+    if rules:
+        return rules[0]
+    return categorize({'merchant':row['merchant_raw'],'description':row['description']},config)
+
+
+@locked
+def reclassify(vault: Path) -> dict:
+    config = load_config(vault)
+    count = 0
+    months=set()
+    with connect(vault) as con:
+        for row in con.execute('SELECT * FROM transactions').fetchall():
+            category = effective_category(con,row,config)
+            if row['category_primary']!=category:
+                con.execute('UPDATE transactions SET category_primary=? WHERE transaction_id=?',(category,row['transaction_id']))
+                count+=1
+                months.add(row['transaction_time'][:7])
+        con.execute("UPDATE report_state SET status='pending'")
+    return dict(updated_count=count,affected_months=sorted(months),artifact_status='pending')
+
+
+@locked
+def set_category(vault: Path, transaction_id: str, category: str, scope='transaction') -> dict:
+    if scope not in ('transaction','merchant-future','merchant-all') or not category.strip():
+        raise ValueError('分类或作用范围无效')
+    with connect(vault) as con:
+        row=con.execute('SELECT * FROM transactions WHERE transaction_id=?',(transaction_id,)).fetchone()
+        if not row:
+            raise ValueError('找不到交易')
+        if row['duplicate_of']:
+            transaction_id=row['duplicate_of']
+            row=con.execute('SELECT * FROM transactions WHERE transaction_id=?',(transaction_id,)).fetchone()
+        value=dict(category=category,scope=scope,previous=row['category_manual'])
+        if scope=='transaction':
+            con.execute('UPDATE transactions SET category_manual=?,category_primary=? WHERE transaction_id=?',(category,category,transaction_id))
+        else:
+            effective = datetime.now().strftime('%Y-%m-%d %H:%M:%S') if scope=='merchant-future' else ''
+            rule=con.execute('INSERT INTO category_rules(merchant,category,effective_from) VALUES(?,?,?)',(row['merchant_raw'],category,effective))
+            value.update(rule_id=rule.lastrowid,effective_from=effective)
+        decision=con.execute("INSERT INTO decisions(kind,target_id,value_json,created_at) VALUES('category',?,?,?)",(transaction_id,json.dumps(value,ensure_ascii=False),datetime.now().isoformat())).lastrowid
+        con.execute("UPDATE report_state SET status='pending'")
+    # Future rules also apply to any already-present future-dated rows.
+    result=reclassify(vault)
+    if scope=='transaction' and row['category_primary']!=category:
+        result['updated_count']+=1
+        result['affected_months']=sorted(set(result['affected_months'])|{row['transaction_time'][:7]})
+    result.update(decision_id=decision, transaction_id=transaction_id,scope=scope)
+    return result
+
+
+@locked
+def undo_decision(vault: Path, decision_id: int) -> dict:
+    with connect(vault) as con:
+        row=con.execute('SELECT * FROM decisions WHERE decision_id=?',(decision_id,)).fetchone()
+        if not row:
+            raise ValueError('找不到人工决定')
+        if not row['active']:
+            return dict(status='already_undone')
+        if row['kind']=='review_patch':
+            value=json.loads(row['value_json'])
+            # Undoing an older patch must not overwrite a later active patch.
+            later=con.execute("SELECT value_json FROM decisions WHERE kind='review_patch' AND target_id=? AND active=1 AND decision_id>?",(row['target_id'],decision_id)).fetchall()
+            later_fields={key for r in later for key in json.loads(r[0])['after']}
+            for key,old in value['before'].items():
+                if key not in later_fields:
+                    earlier=con.execute("SELECT value_json FROM decisions WHERE kind='review_patch' AND target_id=? AND active=1 AND decision_id<? ORDER BY decision_id DESC",(row['target_id'],decision_id)).fetchall()
+                    old=next((json.loads(r[0])['after'][key] for r in earlier if key in json.loads(r[0])['after']),old)
+                    con.execute('UPDATE transactions SET '+key+'=? WHERE transaction_id=?',(old,row['target_id']))
+            con.execute('UPDATE decisions SET active=0 WHERE decision_id=?',(decision_id,))
+            match_duplicates(con);match_refunds(con)
+            con.execute("UPDATE report_state SET status='pending'")
+            return dict(status='undone',artifact_status='pending')
+        if row['kind']!='category':
+            raise ValueError('此决定请使用对应的解除/批次撤销操作')
+        value=json.loads(row['value_json'])
+        con.execute('UPDATE decisions SET active=0 WHERE decision_id=?',(decision_id,))
+        if value['scope']=='transaction':
+            previous=con.execute("SELECT value_json FROM decisions WHERE kind='category' AND target_id=? AND active=1 ORDER BY decision_id DESC",(row['target_id'],)).fetchall()
+            previous=next((json.loads(r[0])['category'] for r in previous if json.loads(r[0])['scope']=='transaction'),None)
+            con.execute('UPDATE transactions SET category_manual=? WHERE transaction_id=?',(previous,row['target_id']))
+        else:
+            con.execute('DELETE FROM category_rules WHERE rule_id=?',(value['rule_id'],))
+        con.execute("INSERT INTO decisions(kind,target_id,value_json,created_at) VALUES('undo_decision',?,?,?)",(str(decision_id),'{}',datetime.now().isoformat()))
+    result=reclassify(vault)
+    result['status']='undone'
+    return result
+
+
+@locked
+def undo_import(vault: Path, batch_id: str) -> dict:
+    with connect(vault) as con:
+        batch=con.execute('SELECT * FROM import_batches WHERE batch_id=?',(batch_id,)).fetchone()
+        if not batch:
+            raise ValueError('找不到导入批次')
+        if batch['status']=='undone':
+            return dict(batch_id=batch_id,status='already_undone',affected_months=[],consumption_changes={})
+        before=_totals(con)
+        con.execute("UPDATE import_batches SET status='undone' WHERE batch_id=?",(batch_id,))
+        con.execute("UPDATE transactions SET active=EXISTS(SELECT 1 FROM transaction_observations o JOIN import_batches b ON b.batch_id=o.batch_id WHERE o.transaction_id=transactions.transaction_id AND b.status='active')")
+        match_duplicates(con)
+        match_refunds(con)
+        after=_totals(con)
+        months={r[0] for r in con.execute('SELECT substr(t.transaction_time,1,7) FROM transactions t JOIN transaction_observations o ON o.transaction_id=t.transaction_id WHERE o.batch_id=?',(batch_id,))}
+        affected=sorted(months|{m for m in set(before)|set(after) if before.get(m,0)!=after.get(m,0)})
+        receipt=dict(batch_id=batch_id,status='undone',affected_months=affected,consumption_changes={m:dict(before=money(before.get(m,0)),after=money(after.get(m,0)),delta=money(after.get(m,0)-before.get(m,0))) for m in affected},artifact_status='pending')
+        decision=con.execute("INSERT INTO decisions(kind,target_id,value_json,created_at) VALUES('undo_import',?,?,?)",(batch_id,json.dumps(receipt,ensure_ascii=False),datetime.now().isoformat())).lastrowid
+        con.execute("UPDATE report_state SET status='pending'")
+    persist_receipt(vault,'undo-'+str(decision)+'.json',receipt)
+    return receipt
+
+
+@locked
+def resolve_review(vault: Path, review_id: str, snapshot: str, changes: dict) -> dict:
+    allowed={'transaction_type','direction','settlement','transfer_scope','status','duplicate_of','raw_id'}
+    if not changes or set(changes)-allowed or not all(isinstance(v,str) for v in changes.values()):
+        raise ValueError('复核字段无效')
+    with connect(vault) as con:
+        item=next((r for r in matching.list_reviews(con) if r['review_id']==review_id and r['snapshot']==snapshot),None)
+        if not item:
+            raise ValueError('候选/问题列表已变化，请重新展示并确认')
+        tid=item['transaction_id'];row=con.execute('SELECT * FROM transactions WHERE transaction_id=?',(tid,)).fetchone()
+        normalized=dict(transaction_date=row['transaction_time'],source_platform=row['source_platform'],merchant=row['merchant_raw'],amount=money(row['amount_minor']),direction=changes.get('direction',row['direction']),transaction_type=changes.get('transaction_type',row['transaction_type']),settlement=changes.get('settlement',row['settlement']),transfer_scope=changes.get('transfer_scope',row['transfer_scope']))
+        validate_row(normalized,'manual')
+        if 'duplicate_of' in changes:
+            target=con.execute('SELECT * FROM transactions WHERE transaction_id=?',(changes['duplicate_of'],)).fetchone()
+            if not target or target['transaction_id']==tid or target['duplicate_of'] or not target['active'] or target['amount_minor']!=row['amount_minor'] or target['transaction_type']!=row['transaction_type']:
+                raise ValueError('无效的规范重复目标')
+            if target['transaction_id'] not in {c['transaction_id'] for c in item['candidates']}:
+                raise ValueError('重复目标不在当前候选中')
+        if 'raw_id' in changes and changes['raw_id'] not in {s['raw_id'] for s in item['sources']}:
+            raise ValueError('来源不在当前活动观测中')
+        before={key:row[key] for key in changes}
+        for key,value in changes.items():
+            con.execute('UPDATE transactions SET '+key+'=? WHERE transaction_id=?',(value,tid))
+        decision=con.execute("INSERT INTO decisions(kind,target_id,value_json,created_at) VALUES('review_patch',?,?,?)",(tid,json.dumps(dict(before=before,after=changes),ensure_ascii=False),datetime.now().isoformat())).lastrowid
+        con.execute("UPDATE review_items SET status='resolved' WHERE review_id=?",(review_id,))
+        match_duplicates(con);match_refunds(con)
+        con.execute("UPDATE report_state SET status='pending'")
+    return dict(status='resolved',decision_id=decision,transaction_id=tid,artifact_status='pending')
+
+
+def doctor(vault: Path) -> dict:
+    target=vault.expanduser().resolve()
+    parent=target
+    while not parent.exists() and parent!=parent.parent:
+        parent=parent.parent
+    return dict(python=sys.version.split()[0],python_supported=sys.version_info>=(3,9),vault=str(target),exists=target.exists(),
+        obsidian_marker=(target/'.obsidian').is_dir(),finance_exists=(target/'Finance/Data/finance.sqlite3').is_file(),
+        writable=os.access(parent,os.W_OK),skill_resources=(Path(__file__).resolve().parents[1]/'assets/config.example.json').is_file(),
+        warning='只读检查；代码仓库不是默认 Vault。无 .obsidian 标记也可由用户明确指定目标。')
+
+
+def connect_readonly(vault: Path):
+    path=database_path(vault)
+    if not path.is_file():
+        raise ValueError('尚未初始化目标 Vault')
+    con=sqlite3.connect(path.as_uri()+'?mode=ro',uri=True)
+    con.row_factory=sqlite3.Row
+    return con
+
+
+def read_report(vault: Path, month=None) -> dict:
+    import finance_reports
+    path=finance_root(vault)/('Months/'+month+'.md' if month else 'Dashboard.md')
+    if month:
+        month_bounds(month)
+    with connect_readonly(vault) as con:
+        state=con.execute('SELECT status,error FROM report_state').fetchone()
+        analysis_status=None
+        if month:
+            current,_=finance_reports.current_payload(vault,month,sys.modules[__name__],con)
+            context=finance_root(vault)/'Data'/('analysis-context-'+month+'.json')
+            old=json.loads(context.read_text()) if context.exists() else {}
+            analysis_status=old.get('analysis_status','pending') if old.get('input_fingerprint')==current['input_fingerprint'] else 'stale'
+    if not path.is_file():
+        raise ValueError('报告尚未生成；请明确请求重建')
+    return dict(path=str(path),content=path.read_text(),artifact_status=state['status'],error=state['error'],analysis_status=analysis_status)
+
+
+def demo(vault: Path) -> dict:
+    if vault.exists():
+        raise ValueError('演示只接受全新目录，不能混入已有账本')
+    vault.mkdir(parents=True,exist_ok=False)
+    source=Path(__file__).resolve().parents[1]/'assets/demo-transactions.csv'
+    receipt=import_with_receipt(vault,source,coverage='partial')
+    build_all_months(vault)
+    return dict(demo=True,receipt=receipt,dashboard=str(finance_root(vault)/'Dashboard.md'))
 
 
 def month_bounds(month: str) -> tuple[str, str]:
@@ -653,17 +822,7 @@ def month_bounds(month: str) -> tuple[str, str]:
     return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
 
-def purchase_net_amount(connection: sqlite3.Connection, purchase: sqlite3.Row) -> int:
-    refunded = connection.execute(
-        """
-        SELECT COALESCE(SUM(t.amount_minor), 0)
-        FROM refund_links rl
-        JOIN transactions t ON t.transaction_id = rl.refund_id
-        WHERE rl.purchase_id = ?
-        """,
-        (purchase["transaction_id"],),
-    ).fetchone()[0]
-    return max(0, purchase["amount_minor"] - refunded)
+purchase_net_amount = matching.purchase_net_amount
 
 
 def is_debt_funded(transaction: sqlite3.Row) -> bool:
@@ -675,431 +834,62 @@ def is_debt_funded(transaction: sqlite3.Row) -> bool:
     return any(keyword in searchable for keyword in ("credit_card", "信用卡", "花呗", "白条"))
 
 
+@locked
 def build_month(vault: Path, month: str) -> Path:
-    init_vault(vault)
-    start, end = month_bounds(month)
-    output = finance_root(vault) / "Months" / "{0}.md".format(month)
-    existing_report = output.read_text(encoding="utf-8") if output.exists() else ""
-    analysis_content = preserved_marker_content(
-        existing_report,
-        "<!-- AI_ANALYSIS_START -->",
-        "<!-- AI_ANALYSIS_END -->",
-        "待 Agent 根据 Data/analysis-context-{0}.json 生成。".format(month),
-    )
-    suggestions_content = preserved_marker_content(
-        existing_report,
-        "<!-- AI_SUGGESTIONS_START -->",
-        "<!-- AI_SUGGESTIONS_END -->",
-        "待 Agent 基于可验证指标生成不超过三条建议。",
-    )
-    visible: List[tuple[sqlite3.Row, int]] = []
-    with connect(vault) as connection:
-        purchases = connection.execute(
-            """
-            SELECT * FROM transactions
-            WHERE transaction_type = 'purchase'
-              AND transaction_time >= ? AND transaction_time < ?
-              AND excluded_reason IS NULL
-            ORDER BY transaction_time, transaction_id
-            """,
-            (start, end),
-        ).fetchall()
-        for purchase in purchases:
-            net = purchase_net_amount(connection, purchase)
-            if net > 0:
-                visible.append((purchase, net))
-        needs_review_count = connection.execute(
-            """
-            SELECT COUNT(*)
-            FROM review_items r
-            JOIN transactions t ON t.transaction_id = r.transaction_id
-            WHERE r.status = 'pending'
-              AND t.transaction_time >= ? AND t.transaction_time < ?
-            """,
-            (start, end),
-        ).fetchone()[0]
-        month_transactions = connection.execute(
-            """
-            SELECT * FROM transactions
-            WHERE transaction_time >= ? AND transaction_time < ?
-              AND excluded_reason IS NULL
-            """,
-            (start, end),
-        ).fetchall()
-
-    cash_outflow = 0
-    refund_inflow = 0
-    debt_repayment = 0
-    new_debt = 0
-    for transaction in month_transactions:
-        transaction_type = transaction["transaction_type"]
-        if transaction_type == "purchase":
-            net = purchase_net_amount_from_visible(visible, transaction["transaction_id"])
-            if is_debt_funded(transaction):
-                new_debt += net
-            elif transaction["direction"] == "expense":
-                cash_outflow += transaction["amount_minor"]
-        elif transaction_type in ("repayment", "installment"):
-            debt_repayment += transaction["amount_minor"]
-            if transaction["direction"] in ("expense", "neutral"):
-                cash_outflow += transaction["amount_minor"]
-        elif transaction_type in ("fee", "interest", "cash_withdrawal"):
-            if transaction["direction"] == "expense":
-                cash_outflow += transaction["amount_minor"]
-        elif transaction_type == "refund" and transaction["direction"] == "income":
-            refund_inflow += transaction["amount_minor"]
-
-    total = sum(net for _, net in visible)
-    lines = [
-        "---",
-        "type: finance-month",
-        "month: {0}".format(month),
-        "total_consumption: {0}".format(money(total)),
-        "cash_outflow: {0}".format(money(cash_outflow)),
-        "refund_inflow: {0}".format(money(refund_inflow)),
-        "debt_repayment: {0}".format(money(debt_repayment)),
-        "new_debt: {0}".format(money(new_debt)),
-        "needs_review_count: {0}".format(needs_review_count),
-        "---",
-        "",
-        "# {0} 财务报告".format(month),
-        "",
-        "## 本月概览",
-        "",
-        "- 本月消费：¥{0}".format(money(total)),
-        "- 实际现金支出：¥{0}".format(money(cash_outflow)),
-        "- 退款流入：¥{0}".format(money(refund_inflow)),
-        "- 债务还款：¥{0}".format(money(debt_repayment)),
-        "- 新增负债：¥{0}".format(money(new_debt)),
-        "",
-        "## 消费明细",
-        "",
-        "| 日期 | 商户 | 分类 | 净消费 |",
-        "| --- | --- | --- | ---: |",
-    ]
-    for transaction, net in visible:
-        lines.append(
-            "| {0} | {1} | {2} | ¥{3} |".format(
-                transaction["transaction_time"][:10],
-                transaction["merchant_raw"].replace("|", "\\|"),
-                transaction["category_primary"],
-                money(net),
-            )
-        )
-    if not visible:
-        lines.append("| — | 本月没有净消费记录 | — | ¥0.00 |")
-    lines.extend(["", "## 数据质量", "", "- 报告由原始记录派生；原始记录未删除。", ""])
-    lines[-4:-4] = [
-        "",
-        "## 消费习惯分析",
-        "",
-        "<!-- AI_ANALYSIS_START -->",
-        analysis_content,
-        "<!-- AI_ANALYSIS_END -->",
-        "",
-        "## 下月建议",
-        "",
-        "<!-- AI_SUGGESTIONS_START -->",
-        suggestions_content,
-        "<!-- AI_SUGGESTIONS_END -->",
-        "",
-    ]
-
-    output.write_text("\n".join(lines), encoding="utf-8")
-    build_review_and_quality_pages(vault)
-    write_analysis_context(
-        vault,
-        month,
-        visible,
-        total,
-        cash_outflow,
-        refund_inflow,
-        debt_repayment,
-        new_debt,
-        needs_review_count,
-    )
-    build_dashboard(
-        vault,
-        month,
-        total,
-        cash_outflow,
-        debt_repayment,
-        new_debt,
-        needs_review_count,
-    )
-    return output
+    import finance_reports
+    month_bounds(month)
+    finance_reports.build_all(vault,sys.modules[__name__],only_month=month)
+    return finance_root(vault)/'Months'/(month+'.md')
 
 
-def preserved_marker_content(text: str, start_marker: str, end_marker: str, default: str) -> str:
+@locked
+def build_all_months(vault: Path) -> List[Path]:
+    import finance_reports
+    return finance_reports.build_all(vault,sys.modules[__name__])
+
+
+@locked
+def write_analysis(vault: Path, month: str, input_fingerprint: str, findings: str, suggestions: str) -> None:
+    import finance_reports
+    finance_reports.write_analysis(vault,month,input_fingerprint,findings,suggestions,sys.modules[__name__])
+
+
+def preserved_marker_content(text, start_marker, end_marker, default):
     if start_marker not in text or end_marker not in text:
         return default
-    content = text.split(start_marker, 1)[1].split(end_marker, 1)[0].strip()
-    return content or default
+    return text.split(start_marker,1)[1].split(end_marker,1)[0].strip() or default
 
 
+def purchase_net_amount_from_visible(visible,transaction_id):
+    return next((net for row,net in visible if row['transaction_id']==transaction_id),0)
+
+
+@locked
 def build_review_and_quality_pages(vault: Path) -> None:
-    with connect(vault) as connection:
-        reviews = connection.execute(
-            """
-            SELECT r.*, t.transaction_time, t.merchant_raw, t.amount_minor,
-                   t.source_platform, t.platform_transaction_id
-            FROM review_items r
-            JOIN transactions t ON t.transaction_id = r.transaction_id
-            WHERE r.status = 'pending'
-            ORDER BY t.transaction_time, r.review_id
-            """
-        ).fetchall()
-        raw_count = connection.execute("SELECT COUNT(*) FROM raw_records").fetchone()[0]
-        transaction_count = connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
-        source_count = connection.execute("SELECT COUNT(*) FROM source_files").fetchone()[0]
-        duplicate_count = connection.execute(
-            "SELECT COUNT(*) FROM transactions WHERE excluded_reason = 'duplicate'"
-        ).fetchone()[0]
-        linked_refund_count = connection.execute(
-            "SELECT COUNT(*) FROM refund_links"
-        ).fetchone()[0]
-
-        review_lines = [
-            "---",
-            "type: finance-review",
-            "pending_count: {0}".format(len(reviews)),
-            "---",
-            "",
-            "# 待确认交易",
-            "",
-        ]
-        if not reviews:
-            review_lines.append("当前没有待确认交易。")
-        for review in reviews:
-            details = json.loads(review["details_json"])
-            review_lines.extend(
-                [
-                    "## {0} · {1} · ¥{2}".format(
-                        review["transaction_time"][:10],
-                        review["merchant_raw"],
-                        money_display(review["amount_minor"]),
-                    ),
-                    "",
-                    "- 退款交易 ID：`{0}`".format(review["transaction_id"]),
-                    "- 平台交易号：`{0}`".format(
-                        review["platform_transaction_id"] or "缺失"
-                    ),
-                    "- 原因：{0}".format(details.get("reason", "unknown")),
-                    "- 候选消费：",
-                ]
-            )
-            candidate_ids = details.get("candidate_purchase_ids", [])
-            if not candidate_ids:
-                review_lines.append("  - 无候选；需要补充账单或人工查找。")
-            for candidate_id in candidate_ids:
-                candidate = connection.execute(
-                    """
-                    SELECT transaction_time, merchant_raw, amount_minor
-                    FROM transactions WHERE transaction_id = ?
-                    """,
-                    (candidate_id,),
-                ).fetchone()
-                if candidate:
-                    review_lines.append(
-                        "  - `{0}` · {1} · {2} · ¥{3}".format(
-                            candidate_id,
-                            candidate["transaction_time"][:10],
-                            candidate["merchant_raw"],
-                            money_display(candidate["amount_minor"]),
-                        )
-                    )
-            review_lines.extend(
-                [
-                    "",
-                    "确认后运行：",
-                    "",
-                    "```bash",
-                    "python3 scripts/finance.py link-refund --vault <VAULT> --refund-id {0} --purchase-id <PURCHASE_ID>".format(
-                        review["transaction_id"]
-                    ),
-                    "```",
-                    "",
-                ]
-            )
-
-    reviews_dir = finance_root(vault) / "Reviews"
-    (reviews_dir / "待确认交易.md").write_text(
-        "\n".join(review_lines), encoding="utf-8"
-    )
-    quality_lines = [
-        "---",
-        "type: finance-data-quality",
-        "---",
-        "",
-        "# 数据质量报告",
-        "",
-        "- 原始文件：{0}".format(source_count),
-        "- 原始记录：{0}".format(raw_count),
-        "- 标准化交易：{0}".format(transaction_count),
-        "- 跨平台重复：{0}".format(duplicate_count),
-        "- 已关联退款：{0}".format(linked_refund_count),
-        "- 待确认交易：{0}".format(len(reviews)),
-        "",
-        "> 截图或平台当前可见账单可能不覆盖已删除记录；没有账单汇总值时，不能声明已经完成金额勾稽。",
-        "",
-    ]
-    (reviews_dir / "数据质量报告.md").write_text(
-        "\n".join(quality_lines), encoding="utf-8"
-    )
+    """V1 compatibility: rebuild review pages from the current ledger."""
+    import finance_reports
+    with connect(vault) as con:
+        finance_reports.build_review_pages(vault,sys.modules[__name__],con)
 
 
-def write_analysis_context(
-    vault: Path,
-    month: str,
-    visible: List[tuple[sqlite3.Row, int]],
-    total: int,
-    cash_outflow: int,
-    refund_inflow: int,
-    debt_repayment: int,
-    new_debt: int,
-    needs_review_count: int,
-) -> Path:
-    categories: Dict[str, int] = defaultdict(int)
-    merchants: Dict[str, int] = defaultdict(int)
-    small_purchase_count = 0
-    small_purchase_minor = 0
-    for transaction, net in visible:
-        categories[transaction["category_primary"]] += net
-        merchants[transaction["merchant_raw"]] += net
-        if net < 5000:
-            small_purchase_count += 1
-            small_purchase_minor += net
-    payload = {
-        "month": month,
-        "metrics": {
-            "total_consumption": money(total),
-            "cash_outflow": money(cash_outflow),
-            "refund_inflow": money(refund_inflow),
-            "debt_repayment": money(debt_repayment),
-            "new_debt": money(new_debt),
-        },
-        "categories": [
-            {"name": name, "amount": money(amount)}
-            for name, amount in sorted(categories.items(), key=lambda item: item[1], reverse=True)
-        ],
-        "top_merchants": [
-            {"name": name, "amount": money(amount)}
-            for name, amount in sorted(merchants.items(), key=lambda item: item[1], reverse=True)[:10]
-        ],
-        "small_purchases": {
-            "threshold": "50.00",
-            "count": small_purchase_count,
-            "amount": money(small_purchase_minor),
-        },
-        "needs_review_count": needs_review_count,
-        "analysis_guardrail": "Only state findings supported by these fields; label incomplete coverage.",
-    }
-    output = finance_root(vault) / "Data" / "analysis-context-{0}.json".format(month)
-    output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+@locked
+def write_analysis_context(vault,month,visible,total,cash_outflow,refund_inflow,debt_repayment,new_debt,needs_review_count):
+    """V1 compatibility. Supplied cached totals never override ledger facts."""
+    import finance_reports
+    with connect(vault) as con:
+        payload,_=finance_reports.current_payload(vault,month,sys.modules[__name__],con)
+    old=finance_reports.read_page(finance_root(vault)/'Months'/(month+'.md'))
+    payload['analysis_status']=finance_reports.analysis_content(finance_root(vault),month,payload,old)[0]
+    output=finance_root(vault)/'Data'/('analysis-context-'+month+'.json')
+    atomic_write_text(output,json.dumps(payload,ensure_ascii=False,indent=2))
     return output
 
 
-def purchase_net_amount_from_visible(
-    visible: List[tuple[sqlite3.Row, int]], transaction_id: str
-) -> int:
-    for transaction, net in visible:
-        if transaction["transaction_id"] == transaction_id:
-            return net
-    return 0
-
-
-def build_dashboard(
-    vault: Path,
-    month: str,
-    total: int,
-    cash_outflow: int,
-    debt_repayment: int,
-    new_debt: int,
-    needs_review_count: int,
-) -> Path:
-    with connect(vault) as connection:
-        debts = connection.execute(
-            """
-            SELECT d.*
-            FROM debt_snapshots d
-            JOIN (
-                SELECT account_name, MAX(as_of_date) AS latest
-                FROM debt_snapshots
-                GROUP BY account_name
-            ) current
-              ON current.account_name = d.account_name
-             AND current.latest = d.as_of_date
-            ORDER BY d.account_name
-            """
-        ).fetchall()
-    lines = [
-        "---",
-        "type: finance-dashboard",
-        "current_month: {0}".format(month),
-        "---",
-        "",
-        "# 个人财务 Dashboard",
-        "",
-        "## 本月核心数字",
-        "",
-        "| 月份 | 本月消费 | 现金支出 | 债务还款 | 新增负债 | 待确认 |",
-        "| --- | ---: | ---: | ---: | ---: | ---: |",
-        "| [[Months/{0}|{0}]] | ¥{1} | ¥{2} | ¥{3} | ¥{4} | {5} |".format(
-            month,
-            money_display(total),
-            money_display(cash_outflow),
-            money_display(debt_repayment),
-            money_display(new_debt),
-            needs_review_count,
-        ),
-        "",
-        "## 债务与待还款",
-        "",
-        "| 账户 | 截止日期 | 剩余待还 | 本期应还 | 最近还款日 |",
-        "| --- | --- | ---: | ---: | --- |",
-    ]
-    for debt in debts:
-        lines.append(
-            "| {0} | {1} | ¥{2} | ¥{3} | {4} |".format(
-                debt["account_name"],
-                debt["as_of_date"],
-                money_display(debt["outstanding_minor"]),
-                money_display(debt["due_minor"]),
-                debt["due_date"] or "—",
-            )
-        )
-    if not debts:
-        lines.append("| — | — | ¥0.00 | ¥0.00 | — |")
-    lines.extend(
-        [
-            "",
-            "## 快速入口",
-            "",
-            "- [[Reviews/待确认交易|待确认交易]]",
-            "- [[Reviews/数据质量报告|数据质量报告]]",
-            "",
-        ]
-    )
-    output = finance_root(vault) / "Dashboard.md"
-    output.write_text("\n".join(lines), encoding="utf-8")
-    return output
-
-
-def build_all_months(vault: Path) -> List[Path]:
-    init_vault(vault)
-    with connect(vault) as connection:
-        months = [
-            row[0]
-            for row in connection.execute(
-                """
-                SELECT DISTINCT substr(transaction_time, 1, 7) AS month
-                FROM transactions
-                WHERE transaction_time GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-*'
-                ORDER BY month
-                """
-            ).fetchall()
-        ]
-    return [build_month(vault, month) for month in months]
+@locked
+def build_dashboard(vault,month,total,cash_outflow,debt_repayment,new_debt,needs_review_count):
+    """V1 compatibility; recompute a consistent Dashboard rather than stale totals."""
+    build_month(vault,month)
+    return finance_root(vault)/'Dashboard.md'
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1112,6 +902,11 @@ def build_parser() -> argparse.ArgumentParser:
     import_command = subparsers.add_parser("import", help="Import a normalized CSV")
     import_command.add_argument("--vault", required=True, type=Path)
     import_command.add_argument("--file", required=True, type=Path)
+    import_command.add_argument('--coverage', choices=('unknown','partial','complete'),default='unknown')
+    import_command.add_argument('--source-reference',default='')
+    import_command.add_argument('--account-name',default='',help='Explicit native statement account identity')
+    import_command.add_argument('--reactivate',action='store_true')
+    import_command.add_argument('--json',action='store_true')
 
     build_command = subparsers.add_parser("build", help="Build a monthly Obsidian report")
     build_command.add_argument("--vault", required=True, type=Path)
@@ -1126,8 +921,8 @@ def build_parser() -> argparse.ArgumentParser:
     debt_command.add_argument("--vault", required=True, type=Path)
     debt_command.add_argument("--account", required=True)
     debt_command.add_argument("--as-of", required=True)
-    debt_command.add_argument("--outstanding", required=True)
-    debt_command.add_argument("--due", default="0")
+    debt_command.add_argument("--outstanding", default="")
+    debt_command.add_argument("--due", default="")
     debt_command.add_argument("--due-date", default="")
 
     link_refund_command = subparsers.add_parser(
@@ -1136,6 +931,7 @@ def build_parser() -> argparse.ArgumentParser:
     link_refund_command.add_argument("--vault", required=True, type=Path)
     link_refund_command.add_argument("--refund-id", required=True)
     link_refund_command.add_argument("--purchase-id", required=True)
+    link_refund_command.add_argument('--snapshot')
 
     archive_command = subparsers.add_parser(
         "archive", help="Archive a PDF, image, or unsupported original before normalization"
@@ -1146,6 +942,34 @@ def build_parser() -> argparse.ArgumentParser:
     archive_command.add_argument(
         "--coverage", choices=("complete", "partial", "unknown"), default="unknown"
     )
+    for name in ('review','reclassify','undo-import','unlink-refund','categorize','undo-decision'):
+        command=subparsers.add_parser(name)
+        command.add_argument('--vault',required=True,type=Path)
+        command.add_argument('--json',action='store_true')
+        if name=='undo-import':
+            command.add_argument('--batch-id',required=True)
+        elif name=='unlink-refund':
+            command.add_argument('--refund-id',required=True)
+        elif name=='categorize':
+            command.add_argument('--transaction-id',required=True)
+            command.add_argument('--category',required=True)
+            command.add_argument('--scope',choices=('transaction','merchant-future','merchant-all'),default='transaction')
+        elif name=='undo-decision':
+            command.add_argument('--decision-id',required=True,type=int)
+    for name in ('doctor','demo','report','write-analysis','resolve-review'):
+        command=subparsers.add_parser(name)
+        command.add_argument('--vault',required=True,type=Path)
+        command.add_argument('--json',action='store_true')
+        if name=='report':
+            command.add_argument('--month')
+        elif name=='write-analysis':
+            command.add_argument('--month',required=True)
+            command.add_argument('--fingerprint',required=True)
+            command.add_argument('--file',required=True,type=Path,help='JSON with findings and suggestions')
+        elif name=='resolve-review':
+            command.add_argument('--review-id',required=True)
+            command.add_argument('--snapshot',required=True)
+            command.add_argument('--changes-json',required=True)
     return parser
 
 
@@ -1153,12 +977,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        if args.command == "init":
+        if args.command=='doctor':
+            print(json.dumps(doctor(args.vault),ensure_ascii=False,indent=2))
+        elif args.command=='demo':
+            print(json.dumps(demo(args.vault),ensure_ascii=False,indent=2))
+        elif args.command=='report':
+            print(json.dumps(read_report(args.vault,args.month),ensure_ascii=False,indent=2))
+        elif args.command=='write-analysis':
+            content=json.loads(args.file.read_text())
+            write_analysis(args.vault,args.month,args.fingerprint,content['findings'],content['suggestions'])
+            print(json.dumps(dict(status='current'),ensure_ascii=False))
+        elif args.command=='resolve-review':
+            print(json.dumps(resolve_review(args.vault,args.review_id,args.snapshot,json.loads(args.changes_json)),ensure_ascii=False))
+        elif args.command == "init":
             init_vault(args.vault)
+            build_all_months(args.vault)
             print("已初始化: {0}".format(finance_root(args.vault)))
         elif args.command == "import":
-            count = import_file(args.vault, args.file)
-            print("已导入 {0} 笔交易".format(count))
+            receipt=import_with_receipt(args.vault,args.file,coverage=args.coverage,source_reference=args.source_reference,reactivate=args.reactivate,account_name=args.account_name)
+            print(json.dumps(receipt,ensure_ascii=False,indent=2))
         elif args.command == "build":
             output = build_month(args.vault, args.month)
             print("已生成: {0}".format(output))
@@ -1176,8 +1013,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             print("已保存负债快照: {0} {1}".format(args.account, args.as_of))
         elif args.command == "link-refund":
-            link_refund_manually(args.vault, args.refund_id, args.purchase_id)
+            link_refund_manually(args.vault, args.refund_id, args.purchase_id,snapshot=args.snapshot)
             print("已人工关联退款: {0} -> {1}".format(args.refund_id, args.purchase_id))
+        elif args.command == 'review':
+            print(json.dumps(list_reviews(args.vault),ensure_ascii=False,indent=2))
+        elif args.command == 'categorize':
+            print(json.dumps(set_category(args.vault,args.transaction_id,args.category,args.scope),ensure_ascii=False))
+        elif args.command == 'reclassify':
+            print(json.dumps(reclassify(args.vault),ensure_ascii=False))
+        elif args.command == 'undo-import':
+            print(json.dumps(undo_import(args.vault,args.batch_id),ensure_ascii=False))
+        elif args.command == 'undo-decision':
+            print(json.dumps(undo_decision(args.vault,args.decision_id),ensure_ascii=False))
+        elif args.command == 'unlink-refund':
+            unlink_refund(args.vault,args.refund_id)
+            print(json.dumps(dict(status='unlinked'),ensure_ascii=False))
         elif args.command == "archive":
             output = archive_file(args.vault, args.file, args.source, args.coverage)
             print("已归档原始文件: {0}".format(output))

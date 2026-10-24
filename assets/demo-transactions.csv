@@ -1,0 +1,5 @@
+transaction_date,source_platform,account_name,merchant,description,amount,direction,transaction_type,payment_method,status,platform_transaction_id,merchant_order_id,account_last4,currency,settlement,transfer_scope,source_reference,source_locator
+2026-07-01 12:00:00,alipay,演示余额,示例书店,合成图书,100.00,expense,purchase,余额,交易成功,DEMO-P1,DEMO-O1,,CNY,unknown,unknown,,row 1
+2026-07-02 12:00:00,alipay,演示余额,示例咖啡店,合成饮品,20.00,expense,purchase,余额,交易成功,DEMO-P2,,,CNY,unknown,unknown,,row 2
+2026-08-01 12:00:00,alipay,演示余额,示例书店,合成部分退款,30.00,income,refund,余额,退款成功,DEMO-R1,DEMO-O1,,CNY,cash,unknown,,row 3
+2026-08-03 12:00:00,bank,演示储蓄卡,示例信用卡,合成本金还款,1000.00,expense,repayment,储蓄卡,成功,DEMO-REPAY,,,CNY,cash,unknown,,row 4

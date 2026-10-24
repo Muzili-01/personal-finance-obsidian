@@ -23,11 +23,21 @@ ln -sfn "$PWD" ~/.claude/skills/personal-finance-obsidian
 
 ## 直接使用
 
-附上账单文件或截图，然后复制这条提示词：
+代码仓库不是默认 Vault。首次使用请明确目标；不必运行 CLI。
+
+Codex：
 
 ```text
-使用 $personal-finance-obsidian 处理我提供的账单，当前工作区就是 Obsidian Vault。请先归档原始文件，再识别消费、退款、还款、分期和内部转账，完成跨平台去重并更新所有受影响月份、Dashboard、待确认交易与数据质量报告。全额退款不要出现在消费面板和消费习惯分析中，但必须保留原始记录；不能唯一匹配的退款不要猜，放入待确认。最后基于可验证数据写消费分析和最多三条下月建议。
+使用 $personal-finance-obsidian，帮我在我指定的 Obsidian Vault 首次设置财务整理；先检查环境和路径，也可以先给我独立的合成演示。
 ```
+
+Claude Code：
+
+```text
+/personal-finance-obsidian 把这些账单整理到我指定的 Obsidian Vault，更新受影响月报，保留原始来源并列出待确认项。
+```
+
+日常可以说“这笔只改成学习”“处理待确认退款”“只查看七月报告”“撤销刚才那批导入”。Agent 调用确定性处理器完成计算；用户无需记内部 ID。只有查看请求时保持只读。
 
 ## 能做什么
 
@@ -35,7 +45,10 @@ ln -sfn "$PWD" ~/.claude/skills/personal-finance-obsidian
 - 归档 PDF、XLSX、邮件和截图，再由 Agent 标准化。
 - 区分消费、现金流、还款、分期、手续费与内部转账。
 - 关联全额、部分和跨月退款；保留无法唯一匹配的候选。
-- 检测支付平台与信用卡中的重复消费。
+- 按账户与可信 ID 幂等导入，保留重叠来源；支付链路和卡尾号充分时合并重复消费。
+- 记录导入回执，撤销批次影响；单笔/商户未来/商户历史分类，人工修正可撤销。
+- 保护月报与首页笔记；分析绑定输入指纹，数据变化后旧分析标为过期。
+- 提供只读环境检查/报告查看、隔离演示、自然语言复核和覆盖/未知状态。
 - 生成 SQLite 总账、Obsidian 月报、Dashboard、负债快照和数据质量报告。
 
 ## 隐私边界
@@ -61,11 +74,17 @@ Finance/
 ├── Months/YYYY-MM.md
 ├── Reviews/
 │   ├── 待确认交易.md
-│   └── 数据质量报告.md
-└── Accounts/
+│   ├── 数据质量报告.md
+│   └── 退款核对.md
+├── Accounts/
+├── Imports/
+├── Backups/
+└── Finance.base                 # 可选，手动从 assets 复制
 ```
 
-SQLite 是规范数据源，Markdown 是可重新生成的展示结果。分类规则保存在 `Finance/Data/config.json`。
+SQLite 是规范数据源，Markdown 是可重新生成的展示结果。分类规则保存在 `Finance/Data/config.json`。生成区外的用户笔记与自定义 Properties 会保留；旧页/旧库先备份，标记损坏时停止覆盖。备份不会自动删除。
+
+仅支持 CNY。直接解析限已识别的支付宝/微信/统一 CSV；其他格式依赖宿主的提取能力。截图默认部分覆盖，没有同口径来源汇总时保持未核对。缺失负债和结算证据显示未知。完整恢复流程见 [CLI 参考](references/cli.md)。
 
 ## 高级用法
 

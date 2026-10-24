@@ -50,3 +50,15 @@ Keep fees and interest visible as financial costs. Keep investment yields as inc
 Use purchase/transaction date for consumption analysis. Use posting date and statement cycle for bank reconciliation. A statement cycle is not a natural month.
 
 Never claim full reconciliation when the source is a screenshot, the platform excludes deleted records, the statement total is unavailable, or unresolved items remain.
+
+## V1.1 decisions and provenance
+
+Strong IDs are scoped to platform, account and visible card tail. All observations remain even when they describe one event. Weak no-ID purchases remain distinct and provisional. Cross-platform automatic consumption merging additionally requires a visible payment gateway and matching card tail, unique in both directions. Refunds against a source duplicate reduce the canonical purchase.
+
+Automatic refunds are allocated as a set, with deterministic total-capacity checks, not by whichever SQL row appears first. Repeated runs do not count the current refund against itself. Same order ID with multiple compatible purchases stays ambiguous. Manual choices remain stable; new conflicting candidates are visible. Unlinking records a rejection and pauses automation until the user explicitly chooses again.
+
+Refund success or credit restoration alone does not prove cash arrival. settlement=cash requires evidence; debt_only produces no cash inflow, unknown is disclosed. A successful refund explicitly to a cash balance is evidence. A purchase row marked “refunded” remains a purchase-status observation and creates review, not an invented second refund event. Failed/closed/cancelled events are excluded. Missing success state, unknown types and unknown transfer purpose are reviewed.
+
+New debt-funded purchases are reported gross in their purchase month; a later refund changes purchase-month net consumption, but cannot imply that historical month-end debt was zero. Missing debt snapshots/fields remain unknown. Financial costs are shown separately; asset conversion is not consumption.
+
+Undo deactivates a batch's contribution, not its evidence. Another active batch can still support the same event. Dependent manual relationships remain in history and are not moved onto another transaction. Reactivation of an undone file is explicit. Transaction category overrides outrank merchant rules; future merchant rules use occurrence time, not import time.

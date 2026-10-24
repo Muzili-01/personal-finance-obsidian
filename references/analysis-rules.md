@@ -4,7 +4,7 @@ Read `Finance/Data/analysis-context-YYYY-MM.json` before writing analysis. Treat
 
 ## Output shape
 
-Write inside the existing markers only:
+Write through write-analysis with the current input_fingerprint; never directly replace an entire report:
 
 ### Consumption habits
 
@@ -26,4 +26,6 @@ Produce at most three suggestions. Each suggestion must name a controllable acti
 - Label results provisional when `needs_review_count` is nonzero or coverage is partial.
 - Separate debt-management suggestions from consumption reduction.
 - Do not provide investment, tax, legal, or credit advice beyond the available records.
-- Preserve the marker comments so later rebuilds retain the Agent-written text.
+- Use the current fingerprint; changed refunds, effective classification, coverage or review inputs invalidate old analysis. Repeated identical imports do not. The processor retains historical analysis in Backups and displays stale/pending status.
+- Do not infer necessity from merchant names. Only compare months when comparison.comparable is true and explain the covered accounts.
+- A read-only viewing request does not authorize analysis generation.
